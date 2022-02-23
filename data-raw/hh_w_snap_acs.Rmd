@@ -1,0 +1,155 @@
+---
+title: "snap_acs"
+output: html_document
+---
+
+# import standard packages
+
+```{r}
+library(sf)
+library(tidyverse)
+library(tmap)
+library(tmaptools)
+library(tigris)
+library(tidycensus)
+library(rmapshaper)
+library(matrixStats)
+library(SpatialAcc)
+library(reticulate)
+library(dplyr)
+library(tidygeocoder)
+library(readxl)
+```
+
+# SNAP ACS data
+
+```{r}
+# create empty data matrix
+all_dmv.co <- matrix(, nrow = 0, ncol = 5)
+all_dmv.tr <- matrix(, nrow = 0, ncol = 5)
+all_dmv.bg <- matrix(, nrow = 0, ncol = 5)
+
+year <- 2019
+for (i in 1:11)
+{
+
+  # get dmv county data
+  dmv.co <- get_acs(geography = "county",
+                   state = c("VA", "DC", "MD"),
+                   year = year,
+                   variables = c(tpop = "B22001_001",
+                                 snap = "B22001_002"),
+                   survey = "acs5",
+                   output = "wide",
+                   geometry = F) %>%
+    mutate(year = year) %>%
+    select(-c(tpopM, snapM))
+  
+  # merge acs data wth food insecurity data from feeding america
+  all_dmv.co <- rbind(all_dmv.co, dmv.co)
+  
+  # get dmv tract data
+  dmv.tr <- get_acs(geography = "tract",
+                   state = c("VA", "DC", "MD"),
+                   year = year,
+                   variables = c(tpop = "B22001_001",
+                                 snap = "B22001_002"),
+                   survey = "acs5",
+                   output = "wide",
+                   geometry = F) %>%
+    mutate(year = year) %>%
+    select(-c(tpopM, snapM))
+  
+  # merge acs data wth food insecurity data from feeding america
+  all_dmv.tr <- rbind(all_dmv.tr, dmv.tr)
+  
+  year <- year - 1
+}
+```
+
+# format share of households receiving snap and send ncr + dcmdva data to database
+
+```{r}
+# get %  receiving snap benefits
+all_dmv.co$share_hh_received_snap <- all_dmv.co$snapE / all_dmv.co$tpopE * 100
+
+# format county measurements
+all_dmv.co2 <- all_dmv.co %>%
+  rename(geoid = GEOID,
+         region_name = NAME,
+         household_received_snap = snapE,
+         share_household_received_snap = share_hh_received_snap) %>%
+  gather(measure, value, c(household_received_snap, share_household_received_snap)) %>%
+  select(-tpopE) %>%
+  mutate(measure_units = as.character(NA),
+         measure_type = ifelse(measure == "share_household_received_snap", "percent", "count"),
+         region_type = "county") %>%
+  relocate("geoid", "region_type", "region_name", "year", "measure", "value", "measure_type", "measure_units")
+
+# get %  receiving snap benefits
+all_dmv.tr$share_hh_received_snap <- all_dmv.tr$snapE / all_dmv.tr$tpopE * 100
+
+# format tract measurements
+all_dmv.tr2 <- all_dmv.tr %>%
+  rename(geoid = GEOID,
+         region_name = NAME,
+         household_received_snap = snapE,
+         share_household_received_snap = share_hh_received_snap) %>%
+  gather(measure, value, c(household_received_snap, share_household_received_snap)) %>%
+  select(-tpopE) %>%
+  mutate(measure_units = as.character(NA),
+         measure_type = ifelse(measure == "share_household_received_snap", "percent", "count"),
+         region_type = "tract") %>%
+  relocate("geoid", "region_type", "region_name", "year", "measure", "value", "measure_type", "measure_units")
+
+# source("~/git/VDH/src/helper_functions.R")
+# con <- get_db_conn(db_pass = "rsu8zvrsu8zv")
+# dc_dbWriteTable(con, "dc_health_behavior_diet", "dcmdva_ct_acs_2009_2019_households_receiving_snap", all_dmv.co2)
+# dc_dbWriteTable(con, "dc_health_behavior_diet", "dcmdva_tr_acs_2009_2019_households_receiving_snap", all_dmv.tr2)
+# dbDisconnect(con)
+
+# Get NCR measurements
+ncr.ct.snap <- all_dmv.co2[all_dmv.co2$geoid %in% c("51013", "51059", "51107", "51510", "51600", "51153", "51683", "51685", "51610", "11001", "24031", "24033", "24017", "24021"),]
+ncr.tr.snap <- all_dmv.tr2[substr(all_dmv.tr2$geoid, 1, 5) %in% c("51013", "51059", "51107", "51510", "51600", "51153", "51683", "51685", "51610", "11001", "24031", "24033", "24017", "24021"),]
+
+# con <- get_db_conn(db_pass = "rsu8zvrsu8zv")
+# dc_dbWriteTable(con, "dc_health_behavior_diet", "ncr_ct_acs_2009_2019_households_receiving_snap", ncr.ct.snap)
+# dc_dbWriteTable(con, "dc_health_behavior_diet", "ncr_tr_acs_2009_2019_households_receiving_snap", ncr.tr.snap)
+# dbDisconnect(con)
+
+```
+
+# get health district values
+
+```{r}
+# read in new health district names
+con <- get_db_conn(db_pass = "rsu8zvrsu8zv")
+va_health_district_geo_names <- st_read(con, query = "SELECT * FROM dc_geographies.va_hd_vdh_2021_health_district_geo_names")
+DBI::dbDisconnect(con)
+
+# get county id's to merge on GEOIDs
+health_district <- read.csv("/project/biocomplexity/sdad/projects_data/vdh/va_county_to_hd.csv")
+health_district$county_id <- as.character(health_district$county_id)
+health_district_full <- merge(va_health_district_geo_names, health_district, by.x = "region_name", by.y = "health_district")
+
+# construct health district measurement
+all_va.hd <- all_dmv.co  %>%
+  merge(health_district_full[, c("geoid", "county_id", "region_type", "region_name")], by.x = "GEOID", by.y = "county_id") %>%
+  group_by(geoid, region_name, year) %>%
+  summarize(tpopE = sum(tpopE),
+            snapE = sum(snapE)) %>%
+  mutate(household_received_snap = snapE,
+         share_household_received_snap = snapE / tpopE  * 100) %>%
+  gather(measure, value, c(household_received_snap, share_household_received_snap)) %>%
+  select(-c(tpopE, snapE)) %>%
+  mutate(measure_units = as.character(NA),
+         measure_type = ifelse(measure == "share_household_received_snap", "percent", "count"),
+         region_type = "health district") %>%
+  relocate("geoid", "region_type", "region_name", "year", "measure", "value", "measure_type", "measure_units")
+
+# send to db
+# source("~/git/VDH/src/helper_functions.R")
+# con <- get_db_conn(db_pass = "rsu8zvrsu8zv")
+# dc_dbWriteTable(con, "dc_health_behavior_diet", "va_hd_acs_2009_2019_households_receiving_snap", all_va.hd)
+# dbDisconnect(con)
+```
